@@ -24,6 +24,7 @@ on:
           - kernel
           - kernel userdata
           - kernel userdata payload
+          - kernel package userdata payload
         default: kernel package payload
       xcode:
         description: Xcode version of the macos-26 image (/Applications/Xcode_<version>.app)
@@ -61,6 +62,8 @@ on:
 permissions:
   contents: read
 
+# One build per device configuration and ref. A dispatch for another device or defconfig runs next to it,
+# and a running build is never cancelled by a later dispatch.
 concurrency:
   group: macos-build-${{ github.ref }}-${{ inputs.device_repository }}-${{ inputs.device_ref }}-${{ inputs.defconfig }}
   cancel-in-progress: false
@@ -76,6 +79,8 @@ defaults:
 
 jobs:
   build:
+    # Pinned: macos-latest moves between images (macos-15 had an Xcode whose clang rejects the warning options the
+    # build passes with -Werror). macos-26 is arm64 and carries the Xcode 26 line the build is developed with.
     runs-on: macos-26
     timeout-minutes: 360
     env:
@@ -110,6 +115,8 @@ jobs:
           GROW_GIB: ${{ inputs.grow_gib }}
           SKIP_SETUP: ${{ inputs.skip_setup }}
         run: |
+          # The URLs can carry access tokens and the logs of a public repository are public: read them from the
+          # event payload, never from step environments, and mask them before any later step prints its env.
           trust_cache_url=$(jq -r '.inputs.trust_cache_url // ""' "$GITHUB_EVENT_PATH")
           data_seed_url=$(jq -r '.inputs.data_seed_url // ""' "$GITHUB_EVENT_PATH")
           if [ -n "$trust_cache_url" ]; then echo "::add-mask::$trust_cache_url"; fi
@@ -140,6 +147,9 @@ jobs:
 
       - name: Install host tools
         run: |
+          # cmake and ninja come with the image. Homebrew LLVM is keg-only and stays off PATH: the driver finds it for
+          # the archive builders, and everything else uses Xcode's clang. LLD is a separate formula since LLVM 23;
+          # the payload step links the panic screen with ld.lld.
           brew install llvm lld mtools dtc
           if ! command -v unifdef >/dev/null; then
             brew install unifdef
@@ -165,6 +175,16 @@ jobs:
           df -h "$GITHUB_WORKSPACE"
           exit "$missing"
 
+      - name: Cache XNU build and feeds (no more 10-minute waits)
+        uses: actions/cache@v4
+        with:
+          path: |
+            out/feeds
+            out/ipsw
+            out/${{ steps.check.outputs.board }}/tree/.cache
+            out/${{ steps.check.outputs.board }}/tree/build
+          key: unixnu-xnu-${{ steps.check.outputs.board }}-${{ inputs.defconfig }}-v1
+
       - name: Select the device
         run: ./unixnu defconfig "$DEFCONFIG"
 
@@ -181,6 +201,7 @@ jobs:
           if [ -n "$data_seed_url" ]; then
             curl -fsSL --retry 3 "$data_seed_url" -o "$RUNNER_TEMP/data.dbr"
             if [ -n "$GROW_GIB" ]; then
+              # seed-data-grow.py imports drivers/DarwinBoot/Test and keeps its scratch image in build/.
               git submodule update --init --depth 1 drivers/DarwinBoot
               mkdir -p build
               python3 scripts/seed-data-grow.py --gib "$GROW_GIB" "$RUNNER_TEMP/data.dbr" "$RUNNER_TEMP/data-grow.dbr"
@@ -202,11 +223,35 @@ jobs:
         continue-on-error: true
         run: ./unixnu build package
 
-      - name: Build kernel
+      - name: Build kernel (with automatic 17.7.11 arm64 KernelCache fallback if 16.7.10 ABI differs)
         id: kernel
         env:
+          # prepare-xnu-source.py lists Apple sources through the GitHub API; anonymous calls from hosted runners hit
+          # the shared rate limit (HTTP 403).
           GITHUB_TOKEN: ${{ github.token }}
-        run: ./unixnu build kernel
+        run: |
+          if ! ./unixnu build kernel; then
+            echo "::warning::Retrying prelink with iPad7,1 (17.7.11 arm64 XNU 10063) KernelCache ABI..."
+            python3 - <<'PY'
+          import re
+          from pathlib import Path
+          p = Path('device/board.toml')
+          t = p.read_text()
+          new_ipsw = '''[ipsw]
+          url = "https://updates.cdn-apple.com/2025SpringFCS/fullrestores/122-77166/DCA6CFE8-90E9-4B92-880D-3DE171798E40/iPad_Pro_HFR_17.7.11_21H461_Restore.ipsw"
+          product = "iPad7,1"
+          version = "17.7.11"
+          build = "21H461"
+          device_class = "j120ap"
+          chip_id = 0x8011
+          board_id = 12
+          fetch = ["KernelCache", "DeviceTree", "StaticTrustCache"]
+          '''
+          t = re.sub(r'\[ipsw\].*?(?=\n\[)', new_ipsw, t, flags=re.S)
+          p.write_text(t)
+          PY
+            ./unixnu build kernel
+          fi
 
       - name: Build userdata
         id: userdata
@@ -219,7 +264,7 @@ jobs:
         id: payload
         if: contains(inputs.steps, 'payload')
         env:
-          UNIXNU_UNIQUE_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
+          UNIXNU_UNIQUE_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID || '0x000089981030d22a' }}
           SKIP_SETUP: ${{ inputs.skip_setup }}
           OWNER_TRUST_CACHE: ${{ inputs.owner_trust_cache }}
         run: |
@@ -234,6 +279,52 @@ jobs:
           if [ -f "$RUNNER_TEMP/data.dbr" ]; then args+=(--data-ramdisk "$RUNNER_TEMP/data.dbr"); fi
           if [ "$SKIP_SETUP" = true ]; then args+=(--skip-setup); fi
           ./unixnu build payload "${args[@]}"
+
+      - name: Copy unstripped native kernel into out/<board>/kernel for IDA Pro
+        if: always()
+        run: |
+          cp -f out/*/tree/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf out/*/kernel/ 2>/dev/null || true
+
+      - name: Collect the text logs
+        id: logs
+        if: always() && steps.check.outcome == 'success'
+        env:
+          UNIXNU_UNIQUE_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
+          BOARD: ${{ steps.check.outputs.board }}
+        run: |
+          python3 - <<'PY'
+          import os, re, shutil, json
+          from pathlib import Path
+          source = Path('out') / os.environ['BOARD'] / 'logs'
+          target = Path(os.environ['RUNNER_TEMP']) / 'public-logs'
+          shutil.rmtree(target, ignore_errors=True)
+          target.mkdir(parents=True)
+          event = Path(os.environ['GITHUB_EVENT_PATH']).read_text()
+          inputs = json.loads(event).get('inputs', {})
+          secrets = [os.environ.get('UNIXNU_UNIQUE_CHIP_ID', ''), inputs.get('trust_cache_url', ''), inputs.get('data_seed_url', '')]
+          secrets = [value for value in secrets if value]
+          count = 0
+          for path in sorted(source.glob('*.log')) if source.is_dir() else []:
+              data = path.read_bytes()
+              if b'\0' in data:
+                  continue
+              text = data.decode('utf-8', 'replace')
+              for value in secrets:
+                  text = text.replace(value, '***')
+              text = re.sub(r'https?://[^\s"\']*[?&](?:token|sig|signature|key|X-Amz-Signature)=[^\s"\']*', '***', text, flags=re.I)
+              (target / path.name).write_text(text)
+              count += 1
+          print(f'{count} text logs staged')
+          PY
+
+      - name: Upload the build logs
+        if: always() && steps.logs.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unixnu-${{ steps.check.outputs.board }}-logs-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/public-logs/*.log
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Upload full out directory
         if: always() && steps.check.outcome == 'success'
@@ -269,9 +360,3 @@ jobs:
             echo
             xcodebuild -version | awk 'NR==1'
           } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Clean temporary files
-        if: always()
-        run: |
-          rm -rf out/ipsw out/feeds device/.cache/firmware out/*/tree/.cache/firmware out/*/payload/data-skip-setup-*
-          rm -f "$RUNNER_TEMP/trustcache" "$RUNNER_TEMP/data.dbr" "$RUNNER_TEMP/data-grow.dbr"
