@@ -120,22 +120,12 @@ jobs:
           [ -f device/board.toml ] || fail "the device repository has no board.toml"
           [ -f "device/configs/$DEFCONFIG" ] || fail "device/configs/$DEFCONFIG not found: $(cd device/configs 2>/dev/null && printf '%s ' *_defconfig)"
           [ -d "$DEVELOPER_DIR" ] || fail "Xcode not found at $DEVELOPER_DIR; installed: $(printf '%s ' /Applications/Xcode_*.app)"
-          if [ -n "$GROW_GIB" ] && ! [[ "$GROW_GIB" =~ ^[0-9]+$ ]]; then fail "grow_gib must be a whole number of GiB"; fi
-          if [ -n "$GROW_GIB" ] && [ -z "$data_seed_url" ]; then fail "grow_gib needs data_seed_url"; fi
-          if [ "$SKIP_SETUP" = true ] && [ -z "$data_seed_url" ]; then fail "skip_setup needs data_seed_url"; fi
-          if [ "$OWNER_TRUST_CACHE" = true ] && [ -z "$trust_cache_url" ]; then fail "owner_trust_cache needs trust_cache_url"; fi
-          if [[ "$STEPS" != *payload* ]] && { [ -n "$trust_cache_url" ] || [ -n "$data_seed_url" ] || [ "$SKIP_SETUP" = true ]; }; then
-            fail "trust_cache_url, data_seed_url and skip_setup only apply to the payload step"
-          fi
           python3 - <<'PY'
           import os, sys, tomllib
           board = tomllib.load(open('device/board.toml', 'rb'))
           name = board.get('board', {}).get('name')
           if not name:
               sys.exit('::error::board.toml needs [board] name')
-          adt = board.get('payload', {}).get('adt', {})
-          if 'payload' in os.environ['STEPS'] and adt.get('unique_chip_id') == 'required' and os.environ['HAS_CHIP_ID'] != 'true':
-              sys.exit('::error::this board needs the platform seed for its payload: set the UNIXNU_UNIQUE_CHIP_ID secret')
           with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
               out.write(f'board={name}\n')
           PY
@@ -148,26 +138,7 @@ jobs:
             echo "$(brew --prefix unifdef)/bin" >> "$GITHUB_PATH"
           fi
 
-      - name: Report the runner toolchain
-        run: |
-          sw_vers
-          uname -m
-          xcodebuild -version
-          xcrun --sdk iphoneos --show-sdk-version
-          xcrun --sdk iphoneos --find mig
-          clang --version | head -n 1
-          "$(brew --prefix llvm)/bin/clang" --version | head -n 1
-          python3 --version
-          missing=0
-          for tool in git make clang cmake ninja unifdef ld.lld mformat mcopy dtc xcodebuild; do
-            path=$(command -v "$tool" || true)
-            printf '%-10s %s\n' "$tool" "${path:-MISSING}"
-            [ -n "$path" ] || missing=1
-          done
-          df -h "$GITHUB_WORKSPACE"
-          exit "$missing"
-
-      - name: Cache XNU build and feeds
+      - name: Aggressive Cache for XNU and UEFI
         uses: actions/cache@v4
         with:
           path: |
@@ -175,30 +146,14 @@ jobs:
             out/ipsw
             out/${{ steps.check.outputs.board }}/tree/.cache
             out/${{ steps.check.outputs.board }}/tree/build
-          key: unixnu-xnu-${{ steps.check.outputs.board }}-${{ inputs.defconfig }}-v1
+            ../Mu-Silicium/Build
+          key: unixnu-cache-${{ steps.check.outputs.board }}-${{ github.sha }}
+          restore-keys: |
+            unixnu-cache-${{ steps.check.outputs.board }}-
+            unixnu-cache-
 
       - name: Select the device
         run: ./unixnu defconfig "$DEFCONFIG"
-
-      - name: Prepare inputs
-        if: contains(inputs.steps, 'payload')
-        env:
-          GROW_GIB: ${{ inputs.grow_gib }}
-        run: |
-          trust_cache_url=$(jq -r '.inputs.trust_cache_url // ""' "$GITHUB_EVENT_PATH")
-          data_seed_url=$(jq -r '.inputs.data_seed_url // ""' "$GITHUB_EVENT_PATH")
-          if [ -n "$trust_cache_url" ]; then
-            curl -fsSL --retry 3 "$trust_cache_url" -o "$RUNNER_TEMP/trustcache"
-          fi
-          if [ -n "$data_seed_url" ]; then
-            curl -fsSL --retry 3 "$data_seed_url" -o "$RUNNER_TEMP/data.dbr"
-            if [ -n "$GROW_GIB" ]; then
-              git submodule update --init --depth 1 drivers/DarwinBoot
-              mkdir -p build
-              python3 scripts/seed-data-grow.py --gib "$GROW_GIB" "$RUNNER_TEMP/data.dbr" "$RUNNER_TEMP/data-grow.dbr"
-              mv "$RUNNER_TEMP/data-grow.dbr" "$RUNNER_TEMP/data.dbr"
-            fi
-          fi
 
       - name: Run pre-build steps
         if: inputs.pre_build != ''
@@ -212,8 +167,10 @@ jobs:
         id: firmware
         if: contains(inputs.steps, 'firmware')
         run: |
-          echo "Cloning Mu-Silicium UEFI from maozedongae/Mu-Silicium..."
-          git clone --depth 1 https://github.com/maozedongae/Mu-Silicium.git ../Mu-Silicium
+          if [ ! -d "../Mu-Silicium" ]; then
+            echo "Cloning Mu-Silicium UEFI from maozedongae/Mu-Silicium..."
+            git clone --depth 1 https://github.com/maozedongae/Mu-Silicium.git ../Mu-Silicium
+          fi
           ./unixnu build firmware --uefi ../Mu-Silicium
 
       - name: Build package (UniXNU.efi and DarwinBoot.efi)
@@ -222,7 +179,7 @@ jobs:
         continue-on-error: true
         run: ./unixnu build package
 
-      - name: Build kernel
+      - name: Build kernel (with automatic 17.7.11 arm64 KernelCache fallback)
         id: kernel
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -255,7 +212,6 @@ jobs:
         if: contains(inputs.steps, 'userdata')
         run: |
           ./unixnu build userdata
-          df -h "$GITHUB_WORKSPACE"
 
       - name: Build payload
         id: payload
@@ -287,47 +243,6 @@ jobs:
         run: |
           cp -f out/*/tree/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf out/*/kernel/ 2>/dev/null || true
 
-      - name: Collect the text logs
-        id: logs
-        if: always() && steps.check.outcome == 'success'
-        env:
-          UNIXNU_UNIQUE_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
-          BOARD: ${{ steps.check.outputs.board }}
-        run: |
-          python3 - <<'PY'
-          import os, re, shutil, json
-          from pathlib import Path
-          source = Path('out') / os.environ['BOARD'] / 'logs'
-          target = Path(os.environ['RUNNER_TEMP']) / 'public-logs'
-          shutil.rmtree(target, ignore_errors=True)
-          target.mkdir(parents=True)
-          event = Path(os.environ['GITHUB_EVENT_PATH']).read_text()
-          inputs = json.loads(event).get('inputs', {})
-          secrets = [os.environ.get('UNIXNU_UNIQUE_CHIP_ID', ''), inputs.get('trust_cache_url', ''), inputs.get('data_seed_url', '')]
-          secrets = [value for value in secrets if value]
-          count = 0
-          for path in sorted(source.glob('*.log')) if source.is_dir() else []:
-              data = path.read_bytes()
-              if b'\0' in data:
-                  continue
-              text = data.decode('utf-8', 'replace')
-              for value in secrets:
-                  text = text.replace(value, '***')
-              text = re.sub(r'https?://[^\s"\']*[?&](?:token|sig|signature|key|X-Amz-Signature)=[^\s"\']*', '***', text, flags=re.I)
-              (target / path.name).write_text(text)
-              count += 1
-          print(f'{count} text logs staged')
-          PY
-
-      - name: Upload the build logs
-        if: always() && steps.logs.outcome == 'success'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: unixnu-${{ steps.check.outputs.board }}-logs-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/public-logs/*.log
-          if-no-files-found: warn
-          retention-days: 7
-
       - name: Upload full out directory
         if: always() && steps.check.outcome == 'success'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -353,7 +268,6 @@ jobs:
         run: |
           {
             echo "## macOS build: ${BOARD:-unknown} (${DEFCONFIG}, ${STEPS})"
-            echo
             echo "| Step | Result |"
             echo "| --- | --- |"
             echo "| firmware | ${FIRMWARE:-skipped} |"
@@ -361,8 +275,6 @@ jobs:
             echo "| kernel | ${KERNEL:-skipped} |"
             echo "| userdata | ${USERDATA:-skipped} |"
             echo "| payload | ${PAYLOAD:-skipped} |"
-            echo
-            xcodebuild -version | awk 'NR==1'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Clean temporary files
